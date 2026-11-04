@@ -1,0 +1,161 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Java 21 and cache Maven dependencies
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Verify, run tests and enforce 70% line coverage
+        run: mvn --batch-mode --no-transfer-progress clean verify
+      - name: Upload executable JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: target/todo-app-1.0.0.jar
+          if-no-files-found: error
+          retention-days: 14
+
+  docker-build-push:
+    name: Build and publish Docker image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Blue-green deploy to VM
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check deploy secrets
+        id: secrets-check
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          if [ -n "$VM_HOST" ] && [ -n "$VM_USER" ] && [ -n "$VM_SSH_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "VM deploy skipped: add VM_HOST, VM_USER and VM_SSH_KEY repository secrets." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Deploy image to VM over SSH
+        if: steps.secrets-check.outputs.enabled == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ needs.docker-build-push.outputs.image }}:sha-${{ github.sha }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: ${{ secrets.VM_SSH_PORT || '22' }}
+          envs: IMAGE,GHCR_USER,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -eu
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$IMAGE"
+            UPSTREAM=/etc/nginx/conf.d/todo-app-upstream.conf
+            if [ -f "$UPSTREAM" ] && grep -q 8081 "$UPSTREAM"; then NEXT=blue; NEXT_PORT=8082; OLD=green; OLD_PORT=8081; else NEXT=green; NEXT_PORT=8081; OLD=blue; OLD_PORT=8082; fi
+            docker rm -f "todo-app-$NEXT" >/dev/null 2>&1 || true
+            docker run -d --name "todo-app-$NEXT" --restart unless-stopped -p "127.0.0.1:${NEXT_PORT}:8080" "$IMAGE"
+            attempt=0
+            until curl --fail --silent "http://127.0.0.1:${NEXT_PORT}/tasks" >/dev/null; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 24 ]; then docker logs "todo-app-$NEXT"; docker rm -f "todo-app-$NEXT"; exit 1; fi
+              sleep 5
+            done
+            printf 'server 127.0.0.1:%s max_fails=3 fail_timeout=10s;\n' "$NEXT_PORT" > "${UPSTREAM}.new"
+            sudo mv "${UPSTREAM}.new" "$UPSTREAM"
+            if ! sudo nginx -t; then printf 'server 127.0.0.1:%s max_fails=3 fail_timeout=10s;\n' "$OLD_PORT" | sudo tee "$UPSTREAM" >/dev/null; docker rm -f "todo-app-$NEXT"; exit 1; fi
+            sudo systemctl reload nginx
+            docker rm -f "todo-app-$OLD" >/dev/null 2>&1 || true
+            docker image prune -f
+            docker logout ghcr.io
+
+  notify:
+    name: Report pipeline result
+    if: always()
+    needs: [build-and-test, docker-build-push, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Summarize result
+        env:
+          BUILD_RESULT: ${{ needs.build-and-test.result }}
+          IMAGE_RESULT: ${{ needs.docker-build-push.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          {
+            echo "## CI/CD result"
+            echo "- Build and tests: ${BUILD_RESULT}"
+            echo "- Docker image: ${IMAGE_RESULT}"
+            echo "- VM deploy: ${DEPLOY_RESULT}"
+            echo "- Commit: \`${COMMIT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
